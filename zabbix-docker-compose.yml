@@ -1,0 +1,236 @@
+# Image pins live HERE, as interpolation defaults, so `git pull` (or
+# re-downloading this file) delivers the exact version combination this
+# repository has tested — no .env editing required. Setting the matching
+# variable in .env overrides the default for anyone who wants to pin
+# differently; .env itself carries only secrets and deliberate overrides.
+# CI (Trivy scans, check-pin-freshness, the ephemeral test .env) reads
+# the pins from these lines — this block is the single source of truth.
+x-images:
+  postgres: &postgres-image ${ZABBIX_POSTGRES_IMAGE_TAG:-postgres:${ZABBIX_POSTGRES_IMAGE_VERSION:-15@sha256:c961aa287d8698297cb26cdfadfbe9fd2cbaf77e53cfffe9636e8d8a1e4d842c}}
+  zabbix-server: &zabbix-server-image ${ZABBIX_SERVER_IMAGE_TAG:-zabbix/zabbix-server-pgsql:${ZABBIX_SERVER_IMAGE_VERSION:-7.0.31-ubuntu@sha256:5b51384f82fa70297f2c02b78238f5fef052b5619b4d26e905740da2dd110c02}}
+  zabbix-web: &zabbix-web-image ${ZABBIX_WEB_IMAGE_TAG:-zabbix/zabbix-web-nginx-pgsql:${ZABBIX_WEB_IMAGE_VERSION:-7.0.31-ubuntu@sha256:a5e13d16bab28fb7de10dc2e5a6c8a002ec08482aea23fe67cf48b59206bc71f}}
+  zabbix-agent: &zabbix-agent-image ${ZABBIX_AGENT_IMAGE_TAG:-zabbix/zabbix-agent2:${ZABBIX_AGENT_IMAGE_VERSION:-7.0.31-ubuntu@sha256:84a2378ad9224c53ab5aace096457d7ac3c22c2a2cc7d79c1d33572068702016}}
+
+networks:
+  zabbix-network:
+    external: true
+
+volumes:
+  zabbix-postgres:
+  zabbix-postgres-backup:
+  zabbix-database-backups:
+
+services:
+  postgres:
+    image: *postgres-image
+    # Hardening: no privilege escalation via setuid binaries
+    security_opt:
+      - no-new-privileges:true
+    # Drop every Linux capability; add back only what this image's
+    # entrypoint needs (bind :80/:443, chown its data directory, drop to
+    # its service user).
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_READ_SEARCH
+      - FOWNER
+      - SETGID
+      - SETUID
+    # Resource limits as .env-overridable defaults (e.g. ZABBIX_POSTGRES_MEMORY_LIMIT=2g);
+    # the override survives every git pull.
+    # Docker's default is ten seconds, then SIGKILL. That is not always enough
+    # for this image to finish shutting down: PostgreSQL has a checkpoint to
+    # write, MariaDB has InnoDB to flush, and Redis saves its dataset on the way
+    # out. Killed halfway, the next start does crash recovery, and a Redis that
+    # held another application's file locks leaves them behind for a person to
+    # clear by hand. Sixty seconds, overridable in .env.
+    stop_grace_period: ${ZABBIX_POSTGRES_STOP_GRACE_PERIOD:-60s}
+    deploy:
+      resources:
+        limits:
+          memory: ${ZABBIX_POSTGRES_MEMORY_LIMIT:-1g}
+          cpus: "${ZABBIX_POSTGRES_CPU_LIMIT:-1.0}"
+        reservations:
+          memory: ${ZABBIX_POSTGRES_MEMORY_RESERVATION:-128m}
+          cpus: "${ZABBIX_POSTGRES_CPU_RESERVATION:-0.25}"
+    volumes:
+      - zabbix-postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: ${ZABBIX_DB_NAME:-zabbixdb}
+      POSTGRES_USER: ${ZABBIX_DB_USER:-zabbixdbuser}
+      POSTGRES_PASSWORD: ${ZABBIX_DB_PASSWORD:?set in .env - see .env.example for generation command}
+    networks:
+      - zabbix-network
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-q", "-d", "${ZABBIX_DB_NAME:-zabbixdb}", "-U", "${ZABBIX_DB_USER:-zabbixdbuser}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  zabbix-server:
+    image: *zabbix-server-image
+    # Hardening: no privilege escalation via setuid binaries
+    security_opt:
+      - no-new-privileges:true
+    # Resource limits as .env-overridable defaults (e.g. ZABBIX_SERVER_MEMORY_LIMIT=2g);
+    # the override survives every git pull.
+    deploy:
+      resources:
+        limits:
+          memory: ${ZABBIX_SERVER_MEMORY_LIMIT:-1g}
+          cpus: "${ZABBIX_SERVER_CPU_LIMIT:-1.0}"
+        reservations:
+          memory: ${ZABBIX_SERVER_MEMORY_RESERVATION:-128m}
+          cpus: "${ZABBIX_SERVER_CPU_RESERVATION:-0.25}"
+    environment:
+      DB_SERVER_HOST: postgres
+      DB_SERVER_PORT: 5432
+      POSTGRES_DB: ${ZABBIX_DB_NAME:-zabbixdb}
+      POSTGRES_USER: ${ZABBIX_DB_USER:-zabbixdbuser}
+      POSTGRES_PASSWORD: ${ZABBIX_DB_PASSWORD}
+      ZBX_CACHESIZE: ${ZABBIX_CACHESIZE:-1G}
+    networks:
+      - zabbix-network
+    ports:
+      - "10051:10051"
+    healthcheck:
+      test: grep -qr "zabbix_server" /proc/*/status || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  zabbix-dashboard:
+    image: *zabbix-web-image
+    # Hardening: no privilege escalation via setuid binaries
+    security_opt:
+      - no-new-privileges:true
+    # Resource limits as .env-overridable defaults (e.g. ZABBIX_DASHBOARD_MEMORY_LIMIT=2g);
+    # the override survives every git pull.
+    deploy:
+      resources:
+        limits:
+          memory: ${ZABBIX_DASHBOARD_MEMORY_LIMIT:-512m}
+          cpus: "${ZABBIX_DASHBOARD_CPU_LIMIT:-1.0}"
+        reservations:
+          memory: ${ZABBIX_DASHBOARD_MEMORY_RESERVATION:-64m}
+          cpus: "${ZABBIX_DASHBOARD_CPU_RESERVATION:-0.25}"
+    environment:
+      DB_SERVER_HOST: postgres
+      DB_SERVER_PORT: 5432
+      POSTGRES_DB: ${ZABBIX_DB_NAME:-zabbixdb}
+      POSTGRES_USER: ${ZABBIX_DB_USER:-zabbixdbuser}
+      POSTGRES_PASSWORD: ${ZABBIX_DB_PASSWORD}
+      ZBX_SERVER_HOST: zabbix-server
+      PHP_TZ: ${ZABBIX_TIMEZONE:-UTC}
+    networks:
+      - zabbix-network
+    ports:
+      - "80:8080"
+      - "443:8443"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      zabbix-server:
+        condition: service_healthy
+
+  zabbix-agent:
+    image: *zabbix-agent-image
+    # Hardening: no privilege escalation via setuid binaries
+    security_opt:
+      - no-new-privileges:true
+    # Resource limits as .env-overridable defaults (e.g. ZABBIX_AGENT_MEMORY_LIMIT=2g);
+    # the override survives every git pull.
+    deploy:
+      resources:
+        limits:
+          memory: ${ZABBIX_AGENT_MEMORY_LIMIT:-512m}
+          cpus: "${ZABBIX_AGENT_CPU_LIMIT:-1.0}"
+        reservations:
+          memory: ${ZABBIX_AGENT_MEMORY_RESERVATION:-64m}
+          cpus: "${ZABBIX_AGENT_CPU_RESERVATION:-0.25}"
+    environment:
+      ZBX_HOSTNAME: Zabbix server
+      ZBX_SERVER_HOST: zabbix-server
+    networks:
+      - zabbix-network
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - zabbix-server
+
+  backups:
+    image: *postgres-image
+    # Hardening: no privilege escalation via setuid binaries
+    security_opt:
+      - no-new-privileges:true
+    # Drop every Linux capability; add back only what this image's
+    # entrypoint needs (bind :80/:443, chown its data directory, drop to
+    # its service user).
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    # Resource limits as .env-overridable defaults (e.g. ZABBIX_BACKUPS_MEMORY_LIMIT=2g);
+    # the override survives every git pull.
+    deploy:
+      resources:
+        limits:
+          memory: ${ZABBIX_BACKUPS_MEMORY_LIMIT:-256m}
+          cpus: "${ZABBIX_BACKUPS_CPU_LIMIT:-0.5}"
+        reservations:
+          memory: ${ZABBIX_BACKUPS_MEMORY_RESERVATION:-32m}
+          cpus: "${ZABBIX_BACKUPS_CPU_RESERVATION:-0.1}"
+    command: >-
+      bash -c 'set -o pipefail;
+      sleep "$$ZABBIX_BACKUP_INIT_SLEEP";
+      while true; do
+        STAMP="$$(date +%Y-%m-%d_%H-%M)";
+        DB_FILE="$$ZABBIX_POSTGRES_BACKUPS_PATH/$$ZABBIX_POSTGRES_BACKUP_NAME-$$STAMP.gz";
+        echo "[$$(date -Iseconds)] Starting database backup to $$DB_FILE";
+        if pg_dump -h postgres -p 5432 -d $$ZABBIX_DB_NAME -U $$ZABBIX_DB_USER | gzip > "$$DB_FILE.partial"; then
+          mv "$$DB_FILE.partial" "$$DB_FILE";
+          echo "[$$(date -Iseconds)] Database backup OK: $$DB_FILE ($$(stat -c %s "$$DB_FILE") bytes)";
+        else
+          echo "[$$(date -Iseconds)] Database backup FAILED - partial file kept as $$DB_FILE.failed for diagnosis" >&2;
+          mv "$$DB_FILE.partial" "$$DB_FILE.failed" 2>/dev/null || true;
+        fi;
+        if [ "$${ZABBIX_POSTGRES_BACKUP_PRUNE_DAYS:-0}" -ge 1 ]; then
+          find "$$ZABBIX_POSTGRES_BACKUPS_PATH" -type f -name "$$ZABBIX_POSTGRES_BACKUP_NAME-*" -mtime "+$$ZABBIX_POSTGRES_BACKUP_PRUNE_DAYS" -delete;
+        fi;
+        sleep "$$ZABBIX_BACKUP_INTERVAL";
+      done'
+    volumes:
+      - zabbix-postgres-backup:/var/lib/postgresql/data
+      - zabbix-database-backups:${ZABBIX_POSTGRES_BACKUPS_PATH:-/srv/zabbix-postgres/backups}
+    environment:
+      ZABBIX_DB_NAME: ${ZABBIX_DB_NAME:-zabbixdb}
+      ZABBIX_DB_USER: ${ZABBIX_DB_USER:-zabbixdbuser}
+      PGPASSWORD: ${ZABBIX_DB_PASSWORD}
+      ZABBIX_BACKUP_INIT_SLEEP: ${ZABBIX_BACKUP_INIT_SLEEP:-30m}
+      ZABBIX_BACKUP_INTERVAL: ${ZABBIX_BACKUP_INTERVAL:-24h}
+      ZABBIX_POSTGRES_BACKUP_PRUNE_DAYS: ${ZABBIX_POSTGRES_BACKUP_PRUNE_DAYS:-7}
+      ZABBIX_POSTGRES_BACKUPS_PATH: ${ZABBIX_POSTGRES_BACKUPS_PATH:-/srv/zabbix-postgres/backups}
+      ZABBIX_POSTGRES_BACKUP_NAME: ${ZABBIX_POSTGRES_BACKUP_NAME:-zabbix-postgres-backup}
+    networks:
+      - zabbix-network
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy

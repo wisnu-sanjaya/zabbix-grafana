@@ -1,0 +1,56 @@
+services:
+  zabbix-dashboard:
+    ports: !override
+      - "8081:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  postgres:
+    volumes: !override
+      - ./data/postgres:/var/lib/postgresql/data
+    shm_size: 256m
+    command: [postgres, -c, shared_buffers=1GB, -c, effective_cache_size=3GB, -c, work_mem=16MB, -c, maintenance_work_mem=256MB]
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+          cpus: "2.0"
+
+  zabbix-server:
+    environment:
+      ZBX_CACHESIZE: 512M
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+
+  backups:
+    volumes: !override
+      - ./data/backups:${ZABBIX_POSTGRES_BACKUPS_PATH:-/srv/zabbix-postgres/backups}
+
+  grafana:
+    image: grafana/grafana-oss:12.0.2
+    container_name: zabbix-grafana
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
+      GF_PLUGINS_PREINSTALL: alexanderzobnin-zabbix-app
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DATE_FORMATS_DEFAULT_TIMEZONE: Asia/Jakarta
+      ZABBIX_API_TOKEN: ${ZABBIX_API_TOKEN}
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3001:3000"
+    networks:
+      - zabbix-network
+    depends_on:
+      - zabbix-dashboard
