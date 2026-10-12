@@ -22,6 +22,7 @@ services:
   zabbix-server:
     environment:
       ZBX_CACHESIZE: 512M
+      ZBX_STARTPINGERS: 10
     deploy:
       resources:
         limits:
