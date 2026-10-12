@@ -11,7 +11,7 @@ datasources:
       trends: true
       trendsFrom: "30d"
       trendsRange: "30d"
-      cacheTTL: "1h"
+      cacheTTL: "5m"
       timeout: 30
     secureJsonData:
       apiToken: $ZABBIX_API_TOKEN
