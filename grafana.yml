@@ -20,6 +20,9 @@ services:
           cpus: "2.0"
 
   zabbix-server:
+    security_opt: !reset []
+    cap_add:
+      - NET_RAW
     environment:
       ZBX_CACHESIZE: 512M
       ZBX_STARTPINGERS: 10
